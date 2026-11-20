@@ -52,3 +52,60 @@ def _mismatch_counts(xp, genome, guide, chunk=50_000_000):
             clean &= seg[j:j + m] < 4
         yield start, mism, pam_ok & clean
         start += m
+
+
+
+def _scan_strand(xp, genome_dev, guide_np, guide_dev, max_mm, strand, chrom, glen, guide_str):
+    hits = []
+    L = len(guide_np)
+    g_host = to_numpy(genome_dev) if False else None  # (kept for clarity; not used)
+    for start, mism, ok in _mismatch_counts(xp, genome_dev, guide_dev):
+        cand = xp.nonzero((mism <= max_mm) & ok)[0]
+        cand = to_numpy(cand)
+        mism_h = to_numpy(mism[cand]) if cand.size else []
+        for idx, k in zip(cand, mism_h):
+            i = int(start + idx)
+            window = to_numpy(genome_dev[i:i + L + PAM_LEN])
+            mmpos = tuple(int(p) for p in np.nonzero(window[:L] != guide_np)[0])
+            pos = i if strand == "+" else glen - (i + L + PAM_LEN)
+            hits.append(Hit(guide_str, chrom, pos, strand, int(k), mmpos,
+                            decode(window[:L]) + " " + decode(window[L:]),
+                            off_target_score(mmpos, int(k))))
+    return hits
+
+
+def search_guide(guide: str, genome_seq: str, chrom: str = "chr", max_mismatches: int = 3,
+                 device: str = "auto"):
+    """Find all NGG-adjacent sites within `max_mismatches` of `guide` on both strands."""
+    xp, _ = get_backend(device)
+    guide_np = encode(guide)
+    if (guide_np > 3).any():
+        raise ValueError("Guide must contain only A/C/G/T.")
+    g_fwd = encode(genome_seq)
+    g_rev = reverse_complement(g_fwd)
+    guide_dev = xp.asarray(guide_np)
+    hits = []
+    for strand, arr in (("+", g_fwd), ("-", g_rev)):
+        hits += _scan_strand(xp, xp.asarray(arr), guide_np, guide_dev, max_mismatches,
+                             strand, chrom, len(g_fwd), guide.upper())
+    hits.sort(key=lambda h: (h.mismatches, -h.score, h.chrom, h.position))
+    return hits
+
+
+def search_guides(guides, fasta_records, max_mismatches=3, device="auto"):
+    """Search many guides against many FASTA records [(name, seq), ...]."""
+    out = {}
+    for gd in guides:
+        res = []
+        for name, seq in fasta_records:
+            res += search_guide(gd, seq, name, max_mismatches, device)
+        res.sort(key=lambda h: (h.mismatches, -h.score))
+        out[gd] = res
+    return out
+
+
+def specificity_score(hits) -> float:
+    """Guide specificity 0-100 (higher = safer). Excludes the on-target exact hit."""
+    off = [h for h in hits if h.mismatches > 0]
+    total = sum(h.score for h in off)
+    return round(10000.0 / (100.0 + total), 2)
